@@ -2,12 +2,13 @@ package miniRPC
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"miniRPC/codec"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -25,7 +26,9 @@ var DefaultOption = &Option{
 }
 
 // 空结构体表示 RPC 服务器，没有任何字段，通过方法提供功能
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map // 并发安全的 Map
+}
 
 // 创建 Server
 func NewServer() *Server {
@@ -105,9 +108,49 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	_ = cc.Close()
 }
 
+func (server *Server) Register(rcvr interface{}) error {
+	// 通过 newService 将传入的服务实例包装成服务对象，提取出该实例的所有可导出方法
+	s := newService(rcvr)
+	// 将提取出的服务注册到 Server 中
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	// 格式为 Service.Method，所以从最后一个点分割出方法名
+	dot := strings.LastIndex(serviceMethod, ".")
+	// 没有点说明格式不正确
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	// 分别查找服务名和方法名
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+	// 从对应的服务中获取方法，然后根据 methodName 查找对应的 methodType
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
+
+// DefaultServer 是一个全局的 Server 实例，方便用户直接用这个函数注册服务，而不需要手动创建 Server 实例
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
+// request 结构体保存一次调用中的所有信息
 type request struct {
-	h            *codec.Header // 请求头
-	argv, replyv reflect.Value // 请求参数和响应值
+	h            *codec.Header // header of request
+	argv, replyv reflect.Value // argv and replyv of request
+	mtype        *methodType
+	svc          *service
 }
 
 // *codec.Header, error 为返回值类型
@@ -127,12 +170,23 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 创建 request 结构体实例，并将 h 字段初始化为 h 变量的值，返回实例的指针
+	// // 创建 request 结构体实例，并将 h 字段初始化为 h 变量的值，返回实例的指针
 	req := &request{h: h}
-	// TODO: 现在我们暂时不知道 body 的类型，先当字符串来处理
-	req.argv = reflect.New(reflect.TypeOf("")) // 通过反射获取类型
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	// 检查 argv 类型是否为指针，如果不是，就使用 Addr() 方法获取其地址的反射值
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body err:", err)
+		return req, err
 	}
 	return req, nil
 }
@@ -146,11 +200,13 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 }
 
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, 调用请求的方法并返回结果
-	// day 1, 先打印请求参数演示
 	// wg.Done() 表示请求处理完成时通知 WaitGroup
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("minirpc response %d", req.h.Seq))
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
