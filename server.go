@@ -10,19 +10,23 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber int        // 用来标识某些特定的请求或数据流，这里用于标记 geerpc 请求
-	CodecType   codec.Type // 编码类型
+	MagicNumber    int           // 用来标识某些特定的请求或数据流，这里用于标记 geerpc 请求
+	CodecType      codec.Type    // 编码类型
+	ConnectTimeout time.Duration // 0 means no limit
+	HandleTimeout  time.Duration
 }
 
 // 配置默认的请求设置
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10, // lian'jie
 }
 
 // 空结构体表示 RPC 服务器，没有任何字段，通过方法提供功能
