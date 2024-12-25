@@ -3,6 +3,7 @@ package miniRPC
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"miniRPC/codec"
@@ -83,14 +84,14 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		return
 	}
 	// 使用指定的编解码器处理请求
-	server.serveCodec(f(conn))
+	server.serveCodec(f(conn), &opt)
 }
 
 // 空结构体，用于在请求处理出错时作为响应的占位符
 var invalidRequest = struct{}{}
 
 // 具体处理请求的逻辑，不断从连接中读取请求并进行处理，直到所有请求处理完毕
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex) // 互斥锁确保每次发送响应时不会出现并发冲突
 	wg := new(sync.WaitGroup)  // 等待组用于等待所有的请求处理完成
 	// 循环处理多个请求
@@ -106,7 +107,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 		}
 		wg.Add(1) // 处理请求后计数器自增
 		// 使用子协程处理请求（一个连接中可能有多个）
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait() //等待所有请求处理完成
 	_ = cc.Close()
@@ -203,14 +204,36 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// wg.Done() 表示请求处理完成时通知 WaitGroup
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	// 创建两个无缓冲通道 called 和 sent，分别用于通知主 goroutine 方法已被调用和响应已被发送
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{} // 发送信号
+		if err != nil {
+			req.h.Error = err.Error() // 设置错误信息
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{} // 发送信号
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{} // 发送信号
+	}()
+	// 如果设置了超时时间，主协程会使用 select 语句监听超时事件或 called 信号
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	// 超时，发送错误响应
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		// 若在超时前服务方法被调用（即接收到 called 信号），则继续等待 sent 信号，确保响应已发送
+	case <-called:
+		<-sent
+	}
 }

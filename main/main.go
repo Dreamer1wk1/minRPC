@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"miniRPC"
 	"net"
@@ -46,9 +47,10 @@ func main() {
 		wg.Add(1)
 		go func(i int) { // i 被作为参数传递给了匿名函数
 			defer wg.Done()
+			ctx, _ := context.WithTimeout(context.Background(), time.Second)
 			args := &Args{Num1: i, Num2: i * i}
 			var reply int
-			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+			if err := client.Call(ctx, "Foo.Sum", args, &reply); err != nil {
 				log.Fatal("call Foo.Sum error:", err)
 			}
 			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
