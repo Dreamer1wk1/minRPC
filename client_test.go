@@ -3,6 +3,8 @@ package miniRPC
 import (
 	"context"
 	"net"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -69,4 +71,24 @@ func TestClient_Call(t *testing.T) {
 		err := client.Call(context.Background(), "Bar.Timeout", 1, &reply)
 		_assert(err != nil && strings.Contains(err.Error(), "handle timeout"), "expect a timeout error")
 	})
+}
+
+func TestXDial(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		ch := make(chan struct{})
+		addr := "/tmp/miniRPC.sock"
+		// 启动监听服务
+		go func() {
+			_ = os.Remove(addr)
+			l, err := net.Listen("unix", addr)
+			if err != nil {
+				t.Fatal("failed to listen unix socket")
+			}
+			ch <- struct{}{} // 通知主线程监听器启动成功
+			Accept(l)
+		}()
+		<-ch                            // 主线程阻塞，直到从通道 ch 接收到服务启动完成的信号
+		_, err := XDial("unix@" + addr) // 测试XDail
+		_assert(err == nil, "failed to connect unix socket")
+	}
 }

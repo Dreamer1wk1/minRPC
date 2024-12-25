@@ -8,6 +8,7 @@ import (
 	"log"
 	"miniRPC/codec"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -236,4 +237,45 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 	case <-called:
 		<-sent
 	}
+}
+
+const (
+	connected        = "200 Connected to miniRPC" // 连接成功的响应
+	defaultRPCPath   = "/_miniRPC_"               // 定义 RPC 请求的默认 HTTP 路径
+	defaultDebugPath = "/debug/miniRPC"           // 定义调试信息的默认 HTTP 路径
+)
+
+// ServeHTTP implements a http.Handler that answers RPC requests
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 检查请求的方法
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		// 只接受 CONNECT 方法，否则返回 405
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	// 用于从 HTTP 连接中获取底层 TCP 连接，使之脱离 HTTP 的控制，进行原生的 TCP 通信
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	// 没有错误，连接成功，向客户端写入连接成功的响应信息
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages on rpcPath.
+// 此方法不会启动 HTTP 服务，启动服务需要通过 http.Serve() 函数
+// So it is still necessary to invoke http.Serve(), typically in a go statement.
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path:", defaultDebugPath)
+}
+
+// 全局辅助方法，用于默认的 DefaultServer 实例注册 HTTP 处理程序
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }
